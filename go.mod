@@ -1,4 +1,4 @@
-module github.com/tiechui1994/cursor-hijack
+module github.com/tiechui1994/cursor-fake
 
 go 1.17
 
