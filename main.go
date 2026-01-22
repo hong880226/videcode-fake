@@ -22,9 +22,9 @@ import (
 )
 
 const (
-	fakeBaseIP   = "127.0.0.0"   // we'll allocate 127.0.0.x per qname
-	defaultTTL   = 60            // seconds, for our synthetic A answers
-	dohTimeout   = 6 * time.Second
+	fakeBaseIP = "127.0.0.0" // we'll allocate 127.0.0.x per qname
+	defaultTTL = 60          // seconds, for our synthetic A answers
+	dohTimeout = 6 * time.Second
 )
 
 type resolverFunc func(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
@@ -43,14 +43,58 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
+type stringListFlag struct {
+	values []string
+}
+
+func (s *stringListFlag) String() string {
+	return strings.Join(s.values, ",")
+}
+
+func (s *stringListFlag) Set(v string) error {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		s.values = append(s.values, "")
+		return nil
+	}
+	// allow both repeated flag and comma-separated for convenience
+	if strings.Contains(v, ",") {
+		parts := strings.Split(v, ",")
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			s.values = append(s.values, p)
+		}
+		return nil
+	}
+	s.values = append(s.values, v)
+	return nil
+}
+
+func (s *stringListFlag) Values() []string {
+	var out []string
+	for _, v := range s.values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+type realInfo struct {
+	ips    []net.IP
+	domain string
+}
+
 type cursorIPMap struct {
 	mu sync.RWMutex
 
 	// qname (fqdn, lower-case) -> fake loopback IP (v4)
 	domainToFake map[string]net.IP
 
-	// fake IP string -> real remote ips (v4/v6) WITHOUT port
-	fakeToReal map[string][]net.IP
+	// fake IP string -> real remote ips (v4/v6) WITHOUT port and qname
+	fakeToReal map[string]*realInfo
 
 	nextOctet byte // allocate 127.0.0.nextOctet
 }
@@ -58,7 +102,7 @@ type cursorIPMap struct {
 func newCursorIPMap() *cursorIPMap {
 	return &cursorIPMap{
 		domainToFake: make(map[string]net.IP),
-		fakeToReal:   make(map[string][]net.IP),
+		fakeToReal:   make(map[string]*realInfo),
 		nextOctet:    2, // 127.0.0.1 often used; start from .2
 	}
 }
@@ -94,36 +138,41 @@ func (m *cursorIPMap) RecordMany(qname string, realIPs []net.IP) net.IP {
 
 	key := fake.String()
 	existing := m.fakeToReal[key]
+	if existing == nil {
+		existing = &realInfo{domain: qname}
+	} else {
+		existing.domain = qname
+	}
 	for _, rip := range realIPs {
 		if rip == nil {
 			continue
 		}
 		dup := false
-		for _, e := range existing {
+		for _, e := range existing.ips {
 			if e != nil && e.Equal(rip) {
 				dup = true
 				break
 			}
 		}
 		if !dup {
-			existing = append(existing, rip)
+			existing.ips = append(existing.ips, rip)
 		}
 	}
 	m.fakeToReal[key] = existing
 	return fake
 }
 
-func (m *cursorIPMap) LookupRealByFake(fake net.IP) (net.IP, bool) {
+func (m *cursorIPMap) LookupRealByFake(fake net.IP) (net.IP, string, bool) {
 	if fake == nil {
-		return nil, false
+		return nil, "", false
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	ips, ok := m.fakeToReal[fake.String()]
-	if !ok || len(ips) == 0 {
-		return nil, false
+	realInfo, ok := m.fakeToReal[fake.String()]
+	if !ok || len(realInfo.ips) == 0 {
+		return nil, "", false
 	}
-	return ips[rand.Intn(len(ips))], true
+	return realInfo.ips[rand.Intn(len(realInfo.ips))], realInfo.domain, true
 }
 
 // --- 1. DNS 劫持部分 ---
@@ -181,22 +230,24 @@ func startForwarder(localListen string, cmap *cursorIPMap, rp *remoteProxyConfig
 				log.Printf("Unexpected local addr type: %T", src.LocalAddr())
 				return
 			}
-			realIP, ok := cmap.LookupRealByFake(laddr.IP)
+			realIP, domain, ok := cmap.LookupRealByFake(laddr.IP)
 			if !ok {
 				log.Printf("No mapping for dst=%s; drop", laddr.IP.String())
 				return
 			}
 
-			remote := net.JoinHostPort(realIP.String(), fmt.Sprintf("%d", laddr.Port))
+			var remote string
 			var dst net.Conn
 			var err error
 			if rp != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
 				defer cancel()
+				remote = net.JoinHostPort(domain, fmt.Sprintf("%d", laddr.Port))
 				log.Printf("Dial remote=%s via proxy=%s (client=%s -> dst=%s)", remote, rp.addr, src.RemoteAddr().String(), laddr.String())
 				dst, err = dialViaRemoteProxy(ctx, rp, remote)
 			} else {
 				// 每次发起 remote 请求（拨号）都打印日志
+				remote = net.JoinHostPort(realIP.String(), fmt.Sprintf("%d", laddr.Port))
 				log.Printf("Dial remote=%s (client=%s -> dst=%s)", remote, src.RemoteAddr().String(), laddr.String())
 				dst, err = net.Dial("tcp", remote)
 			}
@@ -351,7 +402,7 @@ func handleDNSQuery(ctx context.Context, r *dns.Msg, upstream resolverFunc, cmap
 	qname := strings.ToLower(dns.Fqdn(q.Name))
 
 	// only hijack cursor.sh (domain-suffix)
-	if (strings.HasSuffix(qname, "cursor.sh") || 
+	if (strings.HasSuffix(qname, "cursor.sh") ||
 		strings.HasSuffix(qname, "cursor.com") ||
 		strings.HasSuffix(qname, "cursorapi.com")) && (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) {
 		realResp, err := upstream(ctx, r)
@@ -606,16 +657,28 @@ func chainResolvers(resolvers ...resolverFunc) resolverFunc {
 func main() {
 	var (
 		listenAddr = flag.String("listen", "127.0.0.1:53", "DNS listen address (udp/tcp). Note: :53 requires root on Linux.")
-		udpAddr    = flag.String("udp-addr", "1.1.1.1:53", "UDP DNS upstream address (host:port). Tried first; then DoT; then DoH. Empty to disable.")
-		dohURL     = flag.String("doh", "https://1.1.1.1/dns-query", "DoH endpoint URL (RFC8484, application/dns-message). Used when -dot-addr is empty.")
-		dotAddr    = flag.String("dot-addr", "", "DoT upstream address (host:port), e.g. 1.1.1.1:853. When set, upstream uses DoT instead of DoH.")
+
+		dotAddr    = flag.String("dot-addr", "1.1.1.1:853", "DoT upstream address (host:port), e.g. 1.1.1.1:853. When set, upstream uses DoT instead of DoH.")
 		dotSNI     = flag.String("dot-server-name", "cloudflare-dns.com", "DoT TLS ServerName (SNI) / certificate name, e.g. cloudflare-dns.com")
 		dotInsec   = flag.Bool("dot-insecure", false, "Skip TLS certificate verification for DoT (NOT recommended)")
 		prewarmDef = flag.Bool("defaults", false, "Pre-warm fake-ip allocation for built-in cursor domains (api2/api3/api4/repo42.cursor.sh)")
 
 		forwardListen = flag.String("forward-listen", ":443", "TCP forward listen addr, e.g. :443 or 127.0.0.1:443 (empty to disable)")
-		remoteProxy  = flag.String("remote-proxy", "", "Optional remote HTTP proxy for forwarding (CONNECT). Example: 10.0.0.2:3128 or https://proxy.example.com:443. Empty to disable.")
+		remoteProxy   = flag.String("remote-proxy", "", "Optional remote HTTP proxy for forwarding (CONNECT). Example: 10.0.0.2:3128 or https://proxy.example.com:443. Empty to disable.")
 	)
+
+	var (
+		udpAddrs stringListFlag
+		dohURLs  stringListFlag
+	)
+	// defaults (repeatable)
+	_ = udpAddrs.Set("114.114.114.114:53")
+	_ = udpAddrs.Set("223.5.5.5:53")
+	_ = dohURLs.Set("https://114.114.114.114/dns-query")
+	_ = dohURLs.Set("https://223.5.5.5/dns-query")
+	flag.Var(&udpAddrs, "udp-addr", "UDP DNS upstream address (host:port). Can be repeated. Tried first (in order); then DoT; then DoH. Use empty to disable.")
+	flag.Var(&dohURLs, "doh", "DoH endpoint URL (RFC8484, application/dns-message). Can be repeated. Tried after DoT (in order). Use empty to disable.")
+
 	flag.Parse()
 
 	cmap := newCursorIPMap()
@@ -629,27 +692,53 @@ func main() {
 	}
 
 	var udpUp resolverFunc
-	if *udpAddr != "" {
-		log.Printf("Upstream(1st): UDP addr=%s", *udpAddr)
+	if addrs := udpAddrs.Values(); len(addrs) > 0 {
+		log.Printf("Upstream(1st): UDP addr=%v", addrs)
 		udpUp = func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-			return resolveViaUDP(ctx, *udpAddr, req)
+			var lastErr error
+			for _, a := range addrs {
+				resp, err := resolveViaUDP(ctx, a, req)
+				if err == nil && resp != nil {
+					return resp, nil
+				}
+				if err != nil {
+					lastErr = err
+				}
+			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("udp upstream disabled")
+			}
+			return nil, lastErr
+		}
+	}
+
+	var dohUp resolverFunc
+	if urls := dohURLs.Values(); len(urls) > 0 {
+		httpClient := &http.Client{Timeout: dohTimeout}
+		log.Printf("Upstream(2nd): DoH url=%v", urls)
+		dohUp = func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+			var lastErr error
+			for _, u := range urls {
+				resp, err := resolveViaDoH(ctx, httpClient, u, req)
+				if err == nil && resp != nil {
+					return resp, nil
+				}
+				if err != nil {
+					lastErr = err
+				}
+			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("doh upstream disabled")
+			}
+			return nil, lastErr
 		}
 	}
 
 	var dotUp resolverFunc
 	if *dotAddr != "" {
-		log.Printf("Upstream(2nd): DoT addr=%s serverName=%s insecure=%v", *dotAddr, *dotSNI, *dotInsec)
+		log.Printf("Upstream(3rd): DoT addr=%s serverName=%s insecure=%v", *dotAddr, *dotSNI, *dotInsec)
 		dotUp = func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 			return resolveViaDoT(ctx, *dotAddr, *dotSNI, *dotInsec, req)
-		}
-	}
-
-	var dohUp resolverFunc
-	if *dohURL != "" {
-		httpClient := &http.Client{Timeout: dohTimeout}
-		log.Printf("Upstream(3rd): DoH url=%s", *dohURL)
-		dohUp = func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-			return resolveViaDoH(ctx, httpClient, *dohURL, req)
 		}
 	}
 

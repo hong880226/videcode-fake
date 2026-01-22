@@ -190,11 +190,11 @@ go run . -remote-proxy 10.0.0.2:3128
 ## 参数一览
 
 - **`-listen`**：本地 DNS 监听地址（udp/tcp），默认 `127.0.0.1:53`
-- **`-udp-addr`**：UDP 上游 DNS 地址（第 1 优先级），默认 `1.1.1.1:53`（空字符串禁用）
+- **`-udp-addr`**：UDP 上游 DNS 地址（第 1 优先级），默认 `1.1.1.1:53`（**可重复指定**，按顺序依次尝试；空字符串禁用）
 - **`-dot-addr`**：DoT 上游地址（第 2 优先级），默认空（不启用）
 - **`-dot-server-name`**：DoT 的 TLS SNI/证书名（仅 `-dot-addr` 生效）
 - **`-dot-insecure`**：DoT 跳过证书校验（不推荐）
-- **`-doh`**：DoH URL（第 3 优先级），默认 `https://1.1.1.1/dns-query`（空字符串禁用）
+- **`-doh`**：DoH URL（第 3 优先级），默认 `https://1.1.1.1/dns-query`（**可重复指定**，按顺序依次尝试；空字符串禁用）
 - **`-forward-listen`**：本地转发监听地址，默认 `:443`（空字符串禁用）
 - **`-remote-proxy`**：可选远端 HTTP 代理（CONNECT），默认空（直连）
 - **`-defaults`**：预热内置域名的 fake-ip + real IP，默认关闭
