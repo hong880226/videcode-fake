@@ -37,6 +37,8 @@ var defaultPrewarmDomains = []string{
 	"downloads.cursor.com",
 	"cursor.com",
 	"marketplace.cursorapi.com",
+	"agent.global.api5.cursor.sh",
+	"us-only.gcpp.cursor.sh",
 }
 
 func init() {
