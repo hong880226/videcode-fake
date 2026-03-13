@@ -112,6 +112,12 @@ nslookup api2.cursor.sh 127.0.0.1
 127.0.0.6 downloads.cursor.com
 127.0.0.7 cursor.com
 127.0.0.8 marketplace.cursorapi.com
+
+127.0.0.2 claude.ai
+127.0.0.3 api.anthropic.com
+127.0.0.4 console.anthropic.com
+127.0.0.5 docs.anthropic.com
+127.0.0.6 anthropic.com
 ```
 
 3) 刷新 DNS 缓存：
