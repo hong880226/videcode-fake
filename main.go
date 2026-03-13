@@ -33,6 +33,11 @@ var defaultHijackSuffixes = []string{
 	"cursor.sh",
 	"cursor.com",
 	"cursorapi.com",
+
+	// Claude / Anthropic
+	"claude.ai",
+	"anthropic.com",
+	"claudeusercontent.com",
 }
 
 var defaultPrewarmDomains = []string{
@@ -45,6 +50,13 @@ var defaultPrewarmDomains = []string{
 	"marketplace.cursorapi.com",
 	"agent.global.api5.cursor.sh",
 	"us-only.gcpp.cursor.sh",
+
+	// Claude / Anthropic
+	"claude.ai",
+	"api.anthropic.com",
+	"console.anthropic.com",
+	"docs.anthropic.com",
+	"anthropic.com",
 }
 
 func init() {
