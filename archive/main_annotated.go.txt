@@ -1,0 +1,1120 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/binary"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/miekg/dns" // 需执行: go get github.com/miekg/dns
+)
+
+/*
+本程序实现了一个“面向 Cursor 相关域名”的 Fake-IP DNS 劫持 + 本地 TCP 透明转发器。
+
+整体工作流如下：
+
+1. 客户端向本地 DNS 服务器查询域名（例如 api2.cursor.sh）
+2. 如果命中 cursor 相关域名：
+   - 程序先去上游 DNS 查询真实 IP
+   - 再分配一个 127.0.0.x 的 fake IP
+   - 给客户端返回 fake IP，而不是真实 IP
+   - 同时记录映射：
+       domain -> fake IP
+       fake IP -> real domain + real IP list
+
+3. 客户端随后访问 fake IP:443
+4. 本地 TCP forwarder 接住该连接，根据“本地目标 IP（即 fake IP）”
+   反查真实域名 / 真实 IP，再发起新的远端 TCP 连接
+5. 双向 io.Copy 进行透明转发，不解密 TLS、不修改 HTTP/2
+
+重要特点：
+- 只针对特定域名后缀进行 DNS 劫持
+- 不做 TLS MITM，不需要安装自签证书
+- 可选通过远端 HTTP/HTTPS 代理发起 CONNECT 隧道
+- 支持上游 DNS fallback：UDP -> DoT -> DoH
+
+当前已知限制（原逻辑保留，不主动修）：
+1. 域名后缀匹配使用了 dns.Fqdn(q.Name) 后的字符串，但 suffix 判断未包含尾点，
+   理论上存在命中失败风险。例如 "api2.cursor.sh." 是否匹配 "cursor.sh"。
+2. AAAA 查询虽然会被识别为需要劫持，但最终返回的仍是 synthetic A 记录，不完全规范。
+3. fake IP 仅使用 127.0.0.x，地址空间很小，超过一定量会回绕冲突。
+4. 没有映射过期淘汰机制。
+*/
+
+const (
+	// fakeBaseIP 是 fake IP 分配的基准网段。
+	// 当前只在 127.0.0.x 上分配，范围较小。
+	fakeBaseIP = "127.0.0.0"
+
+	// 合成 A 记录返回给客户端时使用的 TTL。
+	defaultTTL = 60
+
+	// 统一的网络超时时间：
+	// - DNS 上游请求
+	// - 远端代理连接
+	// - DoT/DoH/UDP 解析
+	dohTimeout = 6 * time.Second
+)
+
+// resolverFunc 抽象了一个 DNS 解析函数。
+// 输入：DNS 请求报文 req
+// 输出：DNS 响应报文 resp 或 error
+type resolverFunc func(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
+
+// 预热用的默认 Cursor 域名列表。
+// 开启 -defaults 后，程序启动时会先为这些域名分配 fake IP，并尝试解析真实 IP。
+var defaultPrewarmDomains = []string{
+	"api2.cursor.sh",
+	"api3.cursor.sh",
+	"api4.cursor.sh",
+	"repo42.cursor.sh",
+	"downloads.cursor.com",
+	"cursor.com",
+	"marketplace.cursorapi.com",
+	"agent.global.api5.cursor.sh",
+	"us-only.gcpp.cursor.sh",
+}
+
+func init() {
+	// 用于后续从某 fake IP 对应的多个真实 IP 中随机挑选一个。
+	rand.Seed(time.Now().UnixNano())
+}
+
+/*
+stringListFlag 是自定义命令行参数类型，支持：
+1. 重复传参，例如：
+   -doh https://a/dns-query -doh https://b/dns-query
+
+2. 逗号分隔，例如：
+   -doh https://a/dns-query,https://b/dns-query
+*/
+type stringListFlag struct {
+	values []string
+}
+
+func (s *stringListFlag) String() string {
+	return strings.Join(s.values, ",")
+}
+
+func (s *stringListFlag) Set(v string) error {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		// 保留空项，后续 Values() 会过滤。
+		s.values = append(s.values, "")
+		return nil
+	}
+
+	// 允许单次参数内用逗号分隔多个值
+	if strings.Contains(v, ",") {
+		parts := strings.Split(v, ",")
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			s.values = append(s.values, p)
+		}
+		return nil
+	}
+
+	s.values = append(s.values, v)
+	return nil
+}
+
+// Values 返回过滤空字符串后的参数列表。
+func (s *stringListFlag) Values() []string {
+	var out []string
+	for _, v := range s.values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// realInfo 表示某个 fake IP 对应的真实目标信息。
+type realInfo struct {
+	// 真实 IP 列表（可包含 IPv4 / IPv6）
+	ips []net.IP
+
+	// 该 fake IP 对应的原始域名（FQDN + lower-case）
+	domain string
+}
+
+/*
+cursorIPMap 是整个 fake-IP 路由机制的核心状态表。
+
+它维护两类映射：
+
+1. domainToFake
+   域名 -> fake IP
+   用于 DNS 劫持阶段，把目标域名稳定映射到某个本地 loopback IP。
+
+2. fakeToReal
+   fake IP -> realInfo
+   用于 TCP forwarder 阶段，根据本地收到的 fake IP 找回真实域名和真实 IP 列表。
+
+并发安全：
+- 使用 RWMutex 保护
+*/
+type cursorIPMap struct {
+	mu sync.RWMutex
+
+	// qname(FQDN, lower-case) -> fake loopback IPv4
+	domainToFake map[string]net.IP
+
+	// fake IP string -> realInfo
+	fakeToReal map[string]*realInfo
+
+	// 当前只在 127.0.0.x 中递增分配最后一个字节
+	nextOctet byte
+}
+
+func newCursorIPMap() *cursorIPMap {
+	return &cursorIPMap{
+		domainToFake: make(map[string]net.IP),
+		fakeToReal:   make(map[string]*realInfo),
+		nextOctet:    2, // 通常避开 127.0.0.1，从 .2 开始
+	}
+}
+
+/*
+getOrAllocFakeLocked 在“已持锁”的前提下，为 qname 获取或分配 fake IP。
+
+注意：
+- 该函数不自己加锁，因此调用方必须先 m.mu.Lock()
+- 当前仅分配 127.0.0.x 范围，规模较小时够用
+- 超过 255 后会回绕到 .2，理论上可能冲突
+*/
+func (m *cursorIPMap) getOrAllocFakeLocked(qname string) net.IP {
+	if ip, ok := m.domainToFake[qname]; ok {
+		return ip
+	}
+
+	base := net.ParseIP(fakeBaseIP).To4()
+	if base == nil {
+		// 理论上不会发生，作为兜底
+		base = net.IPv4(127, 0, 0, 0)
+	}
+
+	ip := net.IPv4(base[0], base[1], base[2], m.nextOctet)
+
+	// 简单回绕逻辑：仅适合小规模使用
+	if m.nextOctet == 255 {
+		m.nextOctet = 2
+	} else {
+		m.nextOctet++
+	}
+
+	m.domainToFake[qname] = ip
+	return ip
+}
+
+/*
+RecordMany 的职责：
+1. 确保 qname 拥有一个稳定的 fake IP
+2. 如果 realIPs 非空，则同步更新 fake IP -> 真实 IP 列表的反向映射
+
+典型调用场景：
+- DNS 劫持时：已从上游解析拿到真实 IP，调用 RecordMany(qname, ips)
+- 预热阶段：先 RecordMany(qname, nil) 占位，再解析真实 IP 后二次更新
+
+返回值：
+- 该 qname 对应的 fake IP
+*/
+func (m *cursorIPMap) RecordMany(qname string, realIPs []net.IP) net.IP {
+	qname = strings.ToLower(dns.Fqdn(qname))
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	fake := m.getOrAllocFakeLocked(qname)
+
+	// 如果没有真实 IP，仅确保 domain->fake 存在
+	if len(realIPs) == 0 {
+		return fake
+	}
+
+	key := fake.String()
+	existing := m.fakeToReal[key]
+	if existing == nil {
+		existing = &realInfo{domain: qname}
+	} else {
+		// 若已有记录，也刷新 domain 字段
+		existing.domain = qname
+	}
+
+	// 追加真实 IP，去重
+	for _, rip := range realIPs {
+		if rip == nil {
+			continue
+		}
+
+		dup := false
+		for _, e := range existing.ips {
+			if e != nil && e.Equal(rip) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			existing.ips = append(existing.ips, rip)
+		}
+	}
+
+	m.fakeToReal[key] = existing
+	return fake
+}
+
+/*
+LookupRealByFake 根据 fake IP 查找真实目标。
+
+返回：
+- 一个随机挑选的真实 IP
+- 对应域名
+- 是否找到
+
+为什么随机挑一个真实 IP：
+- 上游解析可能返回多个 A/AAAA，随机选择可以更接近真实负载分布
+*/
+func (m *cursorIPMap) LookupRealByFake(fake net.IP) (net.IP, string, bool) {
+	if fake == nil {
+		return nil, "", false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	realInfo, ok := m.fakeToReal[fake.String()]
+	if !ok || len(realInfo.ips) == 0 {
+		return nil, "", false
+	}
+
+	return realInfo.ips[rand.Intn(len(realInfo.ips))], realInfo.domain, true
+}
+
+// --- 1. DNS 服务部分 ---
+
+/*
+startDNSServer 启动本地 DNS 服务器，同时监听 UDP/TCP。
+
+处理逻辑：
+- 所有 DNS 请求统一交给 resolve(ctx, req)
+- 如果 resolve 出错，则向客户端返回 SERVFAIL
+
+为什么同时监听 UDP/TCP：
+- 大多数 DNS 请求是 UDP
+- 某些客户端或超长响应会改走 TCP
+*/
+func startDNSServer(listenAddr string, resolve resolverFunc) {
+	handler := dns.NewServeMux()
+
+	handler.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
+		defer cancel()
+
+		resp, err := resolve(ctx, r)
+		if err != nil {
+			m := new(dns.Msg)
+			m.SetRcode(r, dns.RcodeServerFailure)
+			_ = w.WriteMsg(m)
+			return
+		}
+		_ = w.WriteMsg(resp)
+	})
+
+	udpServer := &dns.Server{Addr: listenAddr, Net: "udp", Handler: handler}
+	tcpServer := &dns.Server{Addr: listenAddr, Net: "tcp", Handler: handler}
+
+	log.Printf("DNS server started at %s (udp/tcp). hijackSuffix=cursor", listenAddr)
+
+	go func() {
+		if err := tcpServer.ListenAndServe(); err != nil {
+			log.Printf("Failed to start DNS TCP server: %v", err)
+		}
+	}()
+
+	if err := udpServer.ListenAndServe(); err != nil {
+		log.Fatalf("Failed to start DNS UDP server: %v", err)
+	}
+}
+
+// --- 2. TCP 透明转发部分（不解 TLS） ---
+
+/*
+startForwarder 启动本地 TCP 转发器，典型监听 :443。
+
+转发原理：
+1. 客户端被 fake-IP DNS 劫持后，会尝试连接 127.0.0.x:443
+2. 本 forwarder 接住连接
+3. 通过 src.LocalAddr() 拿到“客户端连到的本地目标 IP”
+4. 这个本地目标 IP 正是之前返回的 fake IP
+5. 通过 fake IP 查表恢复真实域名 / 真实 IP
+6. 再向真实服务端发起连接，最后双向透传
+
+两种出站方式：
+- 无 remote proxy：直连 realIP:port
+- 有 remote proxy：向代理发 CONNECT domain:port
+
+注意：
+- 不读取 TLS SNI
+- 不解密 TLS
+- 不改写 HTTP 内容
+- 只是纯 TCP tunnel
+*/
+func startForwarder(localListen string, cmap *cursorIPMap, rp *remoteProxyConfig) {
+	listener, err := net.Listen("tcp", localListen)
+	if err != nil {
+		log.Fatalf("Failed to start forwarder: %v", err)
+	}
+
+	log.Printf("Traffic Forwarder started at %s (routes by local dst ip)\n", localListen)
+
+	for {
+		clientConn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Accept error: %v", err)
+			continue
+		}
+
+		go func(src net.Conn) {
+			defer src.Close()
+
+			laddr, ok := src.LocalAddr().(*net.TCPAddr)
+			if !ok {
+				log.Printf("Unexpected local addr type: %T", src.LocalAddr())
+				return
+			}
+
+			realIP, domain, ok := cmap.LookupRealByFake(laddr.IP)
+			if !ok {
+				log.Printf("No mapping for dst=%s; drop", laddr.IP.String())
+				return
+			}
+
+			var remote string
+			var dst net.Conn
+			var err error
+
+			if rp != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
+				defer cancel()
+
+				// remote proxy 模式下优先用域名，让代理侧自行解析。
+				remote = net.JoinHostPort(domain, fmt.Sprintf("%d", laddr.Port))
+				log.Printf("Dial remote=%s via proxy=%s (client=%s -> dst=%s)",
+					remote, rp.addr, src.RemoteAddr().String(), laddr.String())
+
+				dst, err = dialViaRemoteProxy(ctx, rp, remote)
+			} else {
+				// 直连模式，直接连真实 IP
+				remote = net.JoinHostPort(realIP.String(), fmt.Sprintf("%d", laddr.Port))
+				log.Printf("Dial remote=%s (client=%s -> dst=%s)",
+					remote, src.RemoteAddr().String(), laddr.String())
+
+				dst, err = net.Dial("tcp", remote)
+			}
+
+			if err != nil {
+				log.Printf("Remote dial error (%s): %v", remote, err)
+				return
+			}
+			defer dst.Close()
+
+			// 双向透传
+			// 这里没有做半关闭和更细的 EOF 处理，保留原始简洁实现。
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			go func() {
+				io.Copy(dst, src)
+				wg.Done()
+			}()
+
+			go func() {
+				io.Copy(src, dst)
+				wg.Done()
+			}()
+
+			wg.Wait()
+		}(clientConn)
+	}
+}
+
+/*
+remoteProxyConfig 表示远端 HTTP 代理配置。
+
+scheme:
+- http  : 与代理之间是纯 TCP
+- https : 与代理之间先建立 TLS，再发 HTTP CONNECT
+*/
+type remoteProxyConfig struct {
+	scheme     string // "http" or "https"
+	addr       string // host:port
+	serverName string // https 代理时用于 TLS SNI
+}
+
+/*
+bufferedConn 用于包装一个 net.Conn + bufio.Reader。
+
+原因：
+dialViaRemoteProxy 中为了读取代理的 HTTP CONNECT 响应，使用了 bufio.Reader。
+若 Reader 内部已经预读了部分后续隧道数据，而我们直接返回原始 conn，则这些缓冲数据会丢失。
+
+因此这里用 bufferedConn 保证后续 Read 优先从 Reader 的缓冲区中读取。
+*/
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+/*
+parseRemoteProxy 解析 -remote-proxy 参数。
+
+支持：
+- host:port              -> 默认按 http:// 处理
+- http://host:port
+- https://host:port
+
+如果未指定端口：
+- http 默认补 80
+- https 默认补 443
+*/
+func parseRemoteProxy(raw string) (*remoteProxyConfig, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	// 允许直接传 host:port
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse remote proxy: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("proxy host empty")
+	}
+
+	host := u.Host
+
+	// 若 host 未显式带端口，则按协议补默认端口
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		// 这里对包含 ':' 的 host 比较谨慎，避免误处理 IPv6
+		if strings.Contains(host, ":") {
+			return nil, fmt.Errorf("proxy needs explicit port: %s", host)
+		}
+		if u.Scheme == "https" {
+			host = net.JoinHostPort(host, "443")
+		} else {
+			host = net.JoinHostPort(host, "80")
+		}
+	}
+
+	h, _, _ := net.SplitHostPort(host)
+	return &remoteProxyConfig{
+		scheme:     u.Scheme,
+		addr:       host,
+		serverName: h,
+	}, nil
+}
+
+/*
+dialViaRemoteProxy 通过远端 HTTP/HTTPS 代理建立 CONNECT 隧道。
+
+targetAddr 形如：
+- domain:443
+- ip:443
+
+处理流程：
+1. 连接到代理
+2. 如果代理是 https，则先做 TLS 握手
+3. 发送 CONNECT targetAddr HTTP/1.1
+4. 读取响应状态行，要求 200
+5. 读取并丢弃响应头
+6. 返回 tunnel 连接（含 buffered reader）
+
+限制：
+- 不支持代理认证
+- 不支持 SOCKS5
+*/
+func dialViaRemoteProxy(ctx context.Context, proxy *remoteProxyConfig, targetAddr string) (net.Conn, error) {
+	if proxy == nil {
+		return nil, fmt.Errorf("proxy is nil")
+	}
+
+	dialer := &net.Dialer{Timeout: dohTimeout}
+
+	var conn net.Conn
+	var err error
+
+	if proxy.scheme == "https" {
+		baseConn, err := dialer.DialContext(ctx, "tcp", proxy.addr)
+		if err != nil {
+			return nil, fmt.Errorf("proxy dial: %w", err)
+		}
+
+		tlsConn := tls.Client(baseConn, &tls.Config{
+			ServerName: proxy.serverName,
+			MinVersion: tls.VersionTLS12,
+		})
+
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = tlsConn.SetDeadline(deadline)
+		}
+
+		if err := tlsConn.Handshake(); err != nil {
+			_ = baseConn.Close()
+			return nil, fmt.Errorf("proxy tls handshake: %w", err)
+		}
+		conn = tlsConn
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", proxy.addr)
+		if err != nil {
+			return nil, fmt.Errorf("proxy dial: %w", err)
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = conn.SetDeadline(deadline)
+		}
+	}
+
+	connectReq := fmt.Sprintf(
+		"CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+		targetAddr, targetAddr,
+	)
+	if _, err := io.WriteString(conn, connectReq); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("proxy write CONNECT: %w", err)
+	}
+
+	br := bufio.NewReaderSize(conn, 8192)
+
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("proxy read status: %w", err)
+	}
+	statusLine = strings.TrimSpace(statusLine)
+
+	if !strings.Contains(statusLine, " 200 ") && !strings.HasSuffix(statusLine, " 200") {
+		_ = conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", statusLine)
+	}
+
+	// 读取并丢弃响应头，直到空行
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("proxy read headers: %w", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	return &bufferedConn{Conn: conn, r: br}, nil
+}
+
+/*
+handleDNSQuery 是 DNS 请求的主策略入口。
+
+策略：
+- 对 cursor.sh / cursor.com / cursorapi.com 相关域名进行 fake-IP 劫持
+- 其他域名直接透传到上游
+
+对目标域名的处理流程：
+1. 先用 upstream 查询真实 DNS
+2. 提取真实 A/AAAA 记录中的 IP
+3. 如果没有 IP，则原样返回上游响应
+4. 若有 IP，则记录映射并返回 synthetic A
+
+注意：
+- 当前 suffix 匹配可能受 FQDN 尾点影响
+- 当前 AAAA 请求也会返回 A，不完全符合规范
+*/
+func handleDNSQuery(ctx context.Context, r *dns.Msg, upstream resolverFunc, cmap *cursorIPMap) (*dns.Msg, error) {
+	if r == nil || len(r.Question) == 0 {
+		return nil, fmt.Errorf("empty dns msg")
+	}
+
+	q := r.Question[0]
+	qname := strings.ToLower(dns.Fqdn(q.Name))
+
+	// 仅对 Cursor 相关域名进行劫持
+	// 注意：这里的 suffix 判断对 FQDN 尾点处理并不严谨，保留原实现。
+	if (strings.HasSuffix(qname, "cursor.sh") ||
+		strings.HasSuffix(qname, "cursor.com") ||
+		strings.HasSuffix(qname, "cursorapi.com")) &&
+		(q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) {
+
+		realResp, err := upstream(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+
+		realIPs := extractAllIPs(realResp)
+		if len(realIPs) == 0 {
+			// 上游没有返回 IP，则不强行造 fake A，直接透传原响应
+			return realResp, nil
+		}
+
+		fake := cmap.RecordMany(qname, realIPs)
+		return buildSyntheticAReply(r, q.Name, fake), nil
+	}
+
+	// 非目标域名：透传
+	return upstream(ctx, r)
+}
+
+/*
+extractAllIPs 从 DNS 响应的 Answer 区提取所有 A / AAAA 记录中的 IP，并去重。
+*/
+func extractAllIPs(resp *dns.Msg) []net.IP {
+	if resp == nil {
+		return nil
+	}
+
+	var out []net.IP
+	for _, rr := range resp.Answer {
+		switch v := rr.(type) {
+		case *dns.A:
+			if v.A != nil {
+				out = append(out, v.A.To4())
+			}
+		case *dns.AAAA:
+			if v.AAAA != nil {
+				out = append(out, v.AAAA.To16())
+			}
+		}
+	}
+
+	// 去重
+	var uniq []net.IP
+	for _, ip := range out {
+		if ip == nil {
+			continue
+		}
+		found := false
+		for _, u := range uniq {
+			if u != nil && u.Equal(ip) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			uniq = append(uniq, ip)
+		}
+	}
+
+	return uniq
+}
+
+/*
+resolveHostIP 用于主动解析某个域名的真实 IP，主要服务于 prewarm。
+
+策略：
+- 先查 A
+- 再查 AAAA
+- 只要拿到非空 IP 列表即返回
+*/
+func resolveHostIP(ctx context.Context, upstream resolverFunc, host string) ([]net.IP, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil, fmt.Errorf("empty host")
+	}
+
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn(host), qtype)
+
+		resp, err := upstream(ctx, m)
+		if err != nil {
+			continue
+		}
+
+		ips := extractAllIPs(resp)
+		if len(ips) > 0 {
+			return ips, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no ip answer for host=%s", host)
+}
+
+/*
+buildSyntheticAReply 构造一个 synthetic A 响应，把 qname 解析到 fake IPv4。
+
+注意：
+- 当前无论原请求是 A / AAAA / ANY，只会返回 A
+- 这是原始实现的重要限制之一
+*/
+func buildSyntheticAReply(req *dns.Msg, qname string, fake net.IP) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetReply(req)
+	m.Authoritative = true
+
+	ip4 := fake.To4()
+	if ip4 == nil {
+		return m
+	}
+
+	fqdn := dns.Fqdn(qname)
+	m.Answer = append(m.Answer, &dns.A{
+		Hdr: dns.RR_Header{
+			Name:   fqdn,
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    defaultTTL,
+		},
+		A: ip4,
+	})
+
+	return m
+}
+
+/*
+resolveViaDoH 通过 RFC8484 DoH 向上游发起 DNS 查询。
+
+实现方式：
+- POST application/dns-message
+- 请求体和响应体均是原始 DNS wire format
+*/
+func resolveViaDoH(ctx context.Context, c *http.Client, dohURL string, req *dns.Msg) (*dns.Msg, error) {
+	wire, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack dns msg: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL, bytes.NewReader(wire))
+	if err != nil {
+		return nil, fmt.Errorf("new http request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/dns-message")
+	httpReq.Header.Set("Accept", "application/dns-message")
+
+	resp, err := c.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("doh request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("doh http status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read doh response: %w", err)
+	}
+
+	out := new(dns.Msg)
+	if err := out.Unpack(body); err != nil {
+		return nil, fmt.Errorf("unpack doh dns msg: %w", err)
+	}
+
+	// 保持响应 ID 与客户端请求一致
+	out.Id = req.Id
+	return out, nil
+}
+
+/*
+resolveViaDoT 通过 DNS-over-TLS 向上游发起 DNS 查询。
+
+DoT 关键点：
+- 使用 TLS 建连
+- 使用 DNS over TCP framing：2 字节长度前缀 + DNS 消息体
+*/
+func resolveViaDoT(ctx context.Context, addr string, serverName string, insecureSkipVerify bool, req *dns.Msg) (*dns.Msg, error) {
+	wire, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack dns msg: %w", err)
+	}
+
+	dialer := &net.Dialer{Timeout: dohTimeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: insecureSkipVerify,
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dot dial: %w", err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	var lenBuf [2]byte
+	if len(wire) > 65535 {
+		return nil, fmt.Errorf("dns message too large: %d", len(wire))
+	}
+
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(wire)))
+	if _, err := conn.Write(lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("dot write len: %w", err)
+	}
+	if _, err := conn.Write(wire); err != nil {
+		return nil, fmt.Errorf("dot write msg: %w", err)
+	}
+
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("dot read len: %w", err)
+	}
+
+	n := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if n <= 0 || n > 65535 {
+		return nil, fmt.Errorf("dot invalid response length: %d", n)
+	}
+
+	respBuf := make([]byte, n)
+	if _, err := io.ReadFull(conn, respBuf); err != nil {
+		return nil, fmt.Errorf("dot read msg: %w", err)
+	}
+
+	out := new(dns.Msg)
+	if err := out.Unpack(respBuf); err != nil {
+		return nil, fmt.Errorf("unpack dot dns msg: %w", err)
+	}
+
+	out.Id = req.Id
+	return out, nil
+}
+
+/*
+resolveViaUDP 通过传统 UDP DNS 向上游解析。
+
+注意：
+- miekg/dns 的 Conn 对这里并未真正用到，保留原实现中的无害冗余变量。
+*/
+func resolveViaUDP(ctx context.Context, addr string, req *dns.Msg) (*dns.Msg, error) {
+	wire, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack dns msg: %w", err)
+	}
+
+	dialer := &net.Dialer{Timeout: dohTimeout}
+	conn, err := dialer.DialContext(ctx, "udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("udp dial: %w", err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	dc := &dns.Conn{Conn: conn}
+	if _, err := conn.Write(wire); err != nil {
+		return nil, fmt.Errorf("udp write msg: %w", err)
+	}
+
+	respBuf := make([]byte, 65535)
+	n, err := conn.Read(respBuf)
+	if err != nil {
+		return nil, fmt.Errorf("udp read msg: %w", err)
+	}
+
+	out := new(dns.Msg)
+	if err := out.Unpack(respBuf[:n]); err != nil {
+		return nil, fmt.Errorf("unpack udp dns msg: %w", err)
+	}
+
+	out.Id = req.Id
+	_ = dc // 原实现残留变量，不影响功能
+	return out, nil
+}
+
+/*
+chainResolvers 将多个 resolver 串成 fallback 链。
+
+策略：
+- 顺序尝试
+- 只要某个 resolver 返回 (resp != nil && err == nil)，立即成功
+- 所有 resolver 都失败时，返回最后一个错误
+
+当前 main 中的链路顺序是：
+UDP -> DoT -> DoH
+*/
+func chainResolvers(resolvers ...resolverFunc) resolverFunc {
+	return func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+		var lastErr error
+
+		for _, r := range resolvers {
+			if r == nil {
+				continue
+			}
+
+			resp, err := r(ctx, req)
+			if err == nil && resp != nil {
+				return resp, nil
+			}
+			if err != nil {
+				lastErr = err
+			}
+		}
+
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no upstream resolvers configured")
+		}
+		return nil, lastErr
+	}
+}
+
+func main() {
+	var (
+		// 本地 DNS 监听地址；Linux 上监听 53 通常需要 root 或 CAP_NET_BIND_SERVICE。
+		listenAddr = flag.String("listen", "127.0.0.1:53", "DNS listen address (udp/tcp). Note: :53 requires root on Linux.")
+
+		// DoT 配置
+		dotAddr  = flag.String("dot-addr", "1.1.1.1:853", "DoT upstream address (host:port), e.g. 1.1.1.1:853. When set, upstream uses DoT instead of DoH.")
+		dotSNI   = flag.String("dot-server-name", "cloudflare-dns.com", "DoT TLS ServerName (SNI) / certificate name, e.g. cloudflare-dns.com")
+		dotInsec = flag.Bool("dot-insecure", false, "Skip TLS certificate verification for DoT (NOT recommended)")
+
+		// 是否对默认 Cursor 域名做预热
+		prewarmDef = flag.Bool("defaults", false, "Pre-warm fake-ip allocation for built-in cursor domains")
+
+		// 本地 TCP forwarder 监听地址；Linux 上监听 443 通常也需要高权限
+		forwardListen = flag.String("forward-listen", ":443", "TCP forward listen addr, e.g. :443 or 127.0.0.1:443 (empty to disable)")
+
+		// 可选远端 HTTP/HTTPS 代理
+		remoteProxy = flag.String("remote-proxy", "", "Optional remote HTTP proxy for forwarding (CONNECT). Example: 10.0.0.2:3128 or https://proxy.example.com:443. Empty to disable.")
+	)
+
+	var (
+		udpAddrs stringListFlag
+		dohURLs  stringListFlag
+	)
+
+	// 默认上游
+	_ = udpAddrs.Set("114.114.114.114:53")
+	_ = udpAddrs.Set("223.5.5.5:53")
+	_ = dohURLs.Set("https://114.114.114.114/dns-query")
+	_ = dohURLs.Set("https://223.5.5.5/dns-query")
+
+	flag.Var(&udpAddrs, "udp-addr", "UDP DNS upstream address (host:port). Can be repeated. Tried first (in order); then DoT; then DoH. Use empty to disable.")
+	flag.Var(&dohURLs, "doh", "DoH endpoint URL (RFC8484, application/dns-message). Can be repeated. Tried after DoT (in order). Use empty to disable.")
+
+	flag.Parse()
+
+	cmap := newCursorIPMap()
+
+	rp, err := parseRemoteProxy(*remoteProxy)
+	if err != nil {
+		log.Fatalf("Invalid -remote-proxy: %v", err)
+	}
+	if rp != nil {
+		log.Printf("Remote proxy enabled: scheme=%s addr=%s", rp.scheme, rp.addr)
+	}
+
+	var udpUp resolverFunc
+	if addrs := udpAddrs.Values(); len(addrs) > 0 {
+		log.Printf("Upstream(1st): UDP addr=%v", addrs)
+
+		udpUp = func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+			var lastErr error
+			for _, a := range addrs {
+				resp, err := resolveViaUDP(ctx, a, req)
+				if err == nil && resp != nil {
+					return resp, nil
+				}
+				if err != nil {
+					lastErr = err
+				}
+			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("udp upstream disabled")
+			}
+			return nil, lastErr
+		}
+	}
+
+	var dohUp resolverFunc
+	if urls := dohURLs.Values(); len(urls) > 0 {
+		httpClient := &http.Client{Timeout: dohTimeout}
+		log.Printf("Upstream(2nd): DoH url=%v", urls)
+
+		dohUp = func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+			var lastErr error
+			for _, u := range urls {
+				resp, err := resolveViaDoH(ctx, httpClient, u, req)
+				if err == nil && resp != nil {
+					return resp, nil
+				}
+				if err != nil {
+					lastErr = err
+				}
+			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("doh upstream disabled")
+			}
+			return nil, lastErr
+		}
+	}
+
+	var dotUp resolverFunc
+	if *dotAddr != "" {
+		log.Printf("Upstream(3rd): DoT addr=%s serverName=%s insecure=%v", *dotAddr, *dotSNI, *dotInsec)
+
+		dotUp = func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+			return resolveViaDoT(ctx, *dotAddr, *dotSNI, *dotInsec, req)
+		}
+	}
+
+	// 实际 fallback 顺序
+	upstream := chainResolvers(udpUp, dotUp, dohUp)
+
+	// 预热逻辑
+	if *prewarmDef {
+		for _, d := range defaultPrewarmDomains {
+			// 无论能否解析真实 IP，先占一个 fake IP
+			fake := cmap.RecordMany(d, nil)
+
+			ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
+			ips, err := resolveHostIP(ctx, upstream, d)
+			cancel()
+
+			if err != nil || len(ips) == 0 {
+				log.Printf("Prewarm: %s -> fake=%s (real unresolved: %v)", dns.Fqdn(d), fake.String(), err)
+				continue
+			}
+
+			_ = cmap.RecordMany(d, ips)
+			log.Printf("Prewarm: %s -> fake=%s real=%v", dns.Fqdn(d), fake.String(), ips)
+		}
+	}
+
+	resolve := func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+		return handleDNSQuery(ctx, req, upstream, cmap)
+	}
+
+	if *forwardListen != "" {
+		go startForwarder(*forwardListen, cmap, rp)
+	}
+
+	startDNSServer(*listenAddr, resolve)
+}
