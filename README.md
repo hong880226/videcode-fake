@@ -209,4 +209,6 @@ go run . -remote-proxy 10.0.0.2:3128
    - 从缓存 realIP 列表中随机选一个，拨号到 `realIP:443`（或经 `-remote-proxy` CONNECT）
    - 双向 `io.Copy` 透传，不解析 TLS 内容
 
+## 来源说明
+1. 原始代码来自https://github.com/tiechui1994/cursor-fake
 
