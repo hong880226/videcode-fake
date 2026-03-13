@@ -1,4 +1,4 @@
-module github.com/tiechui1994/cursor-fake
+module github.com/hong880226/videcode-fake
 
 go 1.17
 
